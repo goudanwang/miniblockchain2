@@ -13,19 +13,19 @@ import pickle
 app.secret_key = 'pos_blockchain_ctf_secret_key_2024'
 url_prefix = '/<string:prefix>'
 
-# DDCTF\{P0S_L0ng_R@ng3_[0-9a-fA-F]{4}Att@ck_[0-9a-fA-F]{4}\}
+# DDCTF\{P0S_H34vy_Ch41n_[0-9a-fA-F]{4}Att@ck_[0-9a-fA-F]{4}\}
 valid_url_prefixs = {
-    'a1b2c3d4e5f6g': 'P0S_L0ng_R@ng3_',
-    'a2b3c4d5e6f7g': 'P0S_L0ng_R@ng3_',
-    'a3b4c5d6e7f8g': 'P0S_L0ng_R@ng3_',
+    'a1b2c3d4e5f6g': 'P0S_H34vy_Ch41n_',
+    'a2b3c4d5e6f7g': 'P0S_H34vy_Ch41n_',
+    'a3b4c5d6e7f8g': 'P0S_H34vy_Ch41n_',
     
-    'b1c2d3e4f5g6h': 'P0S_L0ng_R@ng3_',
-    'b2c3d4e5f6g7h': 'P0S_L0ng_R@ng3_',
-    'b3c4d5e6f7g8h': 'P0S_L0ng_R@ng3_',
+    'b1c2d3e4f5g6h': 'P0S_H34vy_Ch41n_',
+    'b2c3d4e5f6g7h': 'P0S_H34vy_Ch41n_',
+    'b3c4d5e6f7g8h': 'P0S_H34vy_Ch41n_',
     
-    'c1d2e3f4g5h6i': 'P0S_L0ng_R@ng3_',
-    'c2d3e4f5g6h7i': 'P0S_L0ng_R@ng3_',
-    'c3d4e5f6g7h8i': 'P0S_L0ng_R@ng3_',
+    'c1d2e3f4g5h6i': 'P0S_H34vy_Ch41n_',
+    'c2d3e4f5g6h7i': 'P0S_H34vy_Ch41n_',
+    'c3d4e5f6g7h8i': 'P0S_H34vy_Ch41n_',
 }
 
 def FLAG():
@@ -220,6 +220,41 @@ def select_validator(prev_block_hash, utxos, timestamp):
     # Fallback (shouldn't reach here)
     return list(stakes.keys())[0]
 
+def calculate_block_weight(block, utxos_at_block):
+    """Calculate the weight of a single block based on validator's stake"""
+    validator_stake = get_validator_stake(block['validator'], utxos_at_block)
+    # Block weight = validator stake * weight multiplier
+    # Use a multiplier to make the weight meaningful
+    return validator_stake * 100
+
+def calculate_chain_weight(chain):
+    """Calculate total weight of a chain (PoS heaviest chain rule)"""
+    if not chain:
+        return 0
+    
+    total_weight = 0
+    current_utxos = {}
+    
+    for block in chain:
+        # Calculate UTXOs at this block
+        for tx in block['transactions']:
+            # Remove consumed UTXOs
+            for input_utxo_id in tx['input']:
+                if input_utxo_id in current_utxos:
+                    del current_utxos[input_utxo_id]
+            # Add new UTXOs
+            for utxo in tx['output']:
+                current_utxos[utxo['id']] = utxo
+        
+        # Calculate block weight based on validator's stake at this point
+        block_weight = calculate_block_weight(block, current_utxos)
+        total_weight += block_weight
+        
+        # Store weight in block for debugging
+        block['weight'] = block_weight
+    
+    return total_weight
+
 def hash_block(block):
     tx_hashes = [tx['hash'] for tx in block['transactions']] if block['transactions'] else []
     if tx_hashes:
@@ -243,7 +278,38 @@ def create_block(prev_block_hash, validator_address, timestamp, transactions, si
     return block
 	
 def find_blockchain_tail():
-    return max(session['blocks'].values(), key=lambda block: block['height'])
+    """Find the tip of the heaviest chain (not longest!)"""
+    if not session['blocks']:
+        return None
+    
+    # Find all chain tips (blocks with no children)
+    all_hashes = set(session['blocks'].keys())
+    child_hashes = set()
+    
+    for block in session['blocks'].values():
+        if block['prev'] in all_hashes:
+            child_hashes.add(block['prev'])
+    
+    tip_hashes = all_hashes - child_hashes
+    
+    # Among all tips, find the one with heaviest chain
+    heaviest_chain = None
+    max_weight = -1
+    heaviest_tip = None
+    
+    for tip_hash in tip_hashes:
+        chain = get_chain_from_block(tip_hash)
+        weight = calculate_chain_weight(chain)
+        
+        if weight > max_weight:
+            max_weight = weight
+            heaviest_chain = chain
+            heaviest_tip = session['blocks'][tip_hash]
+    
+    if heaviest_tip:
+        heaviest_tip['chain_weight'] = max_weight
+    
+    return heaviest_tip
 
 def get_chain_from_block(block_hash):
     """Get the chain from genesis to the given block"""
@@ -312,23 +378,18 @@ def append_block(block):
     parent_block = session['blocks'][block['prev']]
     utxos = calculate_utxo(parent_block)
     
-    # VULNERABILITY: Long-range attack weakness
-    # If this block creates a longer chain than current main chain, accept it even if it rewrites history
-    current_tail = find_blockchain_tail()
-    new_block_height = parent_block['height'] + 1
+    # VULNERABILITY: Long-range attack weakness in validator selection
+    # Check if this is a long-range attack (building from genesis)
+    is_long_range_attack = (block['prev'] == session['genesis_block_hash'])
     
-    # Special case: Allow long-range attacks for educational purposes
-    # If the new chain is longer or equal, and starts from genesis, allow historical rewrite
-    if block['prev'] == session['genesis_block_hash'] and new_block_height >= current_tail['height']:
-        print(f"[LONG-RANGE ATTACK DETECTED] Allowing historical rewrite from genesis")
-        # In this case, we allow more flexible validator selection for demonstration
-        # This simulates the "nothing at stake" problem in PoS
-        pass
-    else:
+    if not is_long_range_attack:
         # Normal validation for non-genesis blocks
         expected_validator = select_validator(block['prev'], utxos, block['timestamp'])
         if block['validator'] != expected_validator:
             raise Exception(f"Invalid validator. Expected {expected_validator}, got {block['validator']}")
+    else:
+        # For long-range attacks, allow more flexible validator selection
+        print(f"[LONG-RANGE ATTACK DETECTED] Allowing flexible validator selection from genesis")
     
     # Verify block signature
     block_hash = hash_block({
@@ -377,11 +438,10 @@ def append_block(block):
             if type(signature) != type(''): raise Exception("unknown type of signature of input utxo")
             
             # CRITICAL VULNERABILITY: Weak signature verification in long-range attacks
-            # This simulates the "nothing at stake" problem where old keys might be compromised
             signature_valid = verify_utxo_signature(utxo['addr'], utxo_id, signature)
             
-            # If this is a long-range attack (building from genesis), allow alternative signature verification
-            if not signature_valid and block['prev'] == session['genesis_block_hash']:
+            # If this is a long-range attack, allow alternative signature verification
+            if not signature_valid and is_long_range_attack:
                 # In long-range attacks, accept if the validator (attacker) signs the UTXO
                 # This simulates key compromise or "nothing at stake" scenarios
                 if verify_utxo_signature(block['validator'], utxo_id, signature):
@@ -404,25 +464,27 @@ def append_block(block):
     if len(session['blocks']) > 100: raise Exception('The blockchain is too long. Use ./reset to reset the blockchain')
     if final_block['hash'] in session['blocks']: raise Exception('A same block is already in the blockchain')
     
-    # LONG-RANGE ATTACK LOGIC: Chain reorganization
+    # Add the new block first
+    session['blocks'][final_block['hash']] = final_block
+    
+    # HEAVIEST CHAIN LOGIC: Check if this creates a heavier chain
     current_tail = find_blockchain_tail()
     
-    # If this is a long-range attack creating a longer or equal chain, reorganize
-    if block['prev'] == session['genesis_block_hash'] and final_block['height'] >= current_tail['height']:
-        print(f"[BLOCKCHAIN REORGANIZATION] New chain height: {final_block['height']}, Current: {current_tail['height']}")
+    # Get the chain containing our new block
+    new_chain = get_chain_from_block(final_block['hash'])
+    new_chain_weight = calculate_chain_weight(new_chain)
+    
+    # Compare with current heaviest chain
+    if current_tail and current_tail['hash'] != final_block['hash']:
+        current_chain = get_chain_from_block(current_tail['hash'])
+        current_chain_weight = calculate_chain_weight(current_chain)
         
-        # Remove all blocks except genesis to simulate chain reorganization
-        genesis_hash = session['genesis_block_hash']
-        new_blocks = {genesis_hash: session['blocks'][genesis_hash]}
+        print(f"[WEIGHT COMPARISON] New chain weight: {new_chain_weight}, Current chain weight: {current_chain_weight}")
         
-        # Add the new block
-        new_blocks[final_block['hash']] = final_block
-        session['blocks'] = new_blocks
-        
-        print(f"[LONG-RANGE ATTACK SUCCESS] Chain reorganized! New main chain established.")
-    else:
-        # Normal block addition
-        session['blocks'][final_block['hash']] = final_block
+        if new_chain_weight > current_chain_weight:
+            print(f"[CHAIN REORGANIZATION] New chain is heavier! Reorganizing...")
+            if is_long_range_attack:
+                print(f"[LONG-RANGE ATTACK SUCCESS] Attacker created heavier chain from genesis!")
     
     session.modified = True
 	
@@ -492,11 +554,16 @@ def get_balance_of_all():
 	
 @app.route(url_prefix+'/')
 def homepage():
-    announcement = 'Welcome to the PoS Blockchain CTF! This blockchain uses Proof-of-Stake consensus. '
+    announcement = 'Welcome to the PoS Blockchain CTF! This blockchain uses Proof-of-Stake with HEAVIEST CHAIN rule. '
     announcement += 'Your goal is to unlock the treasure by becoming the dominant validator. '
-    announcement += 'Hint: Long-range attacks might be possible if you can manipulate the validator selection... '
+    announcement += 'Hint: Long-range attacks might work if you can create a heavier chain from genesis... '
     
-    balance, utxos, _ = get_balance_of_all()
+    balance, utxos, tail = get_balance_of_all()
+    if tail:
+        weight_info = f'Current chain weight: {getattr(tail, "chain_weight", "calculating...")}'
+    else:
+        weight_info = 'No chain found'
+    
     genesis_block_info = 'Hash of genesis block: ' + session['genesis_block_hash']
     addr_info = ('Addresses - Bank: ' + bank_address + 
                 ', Validator1: ' + validator1_address + 
@@ -508,7 +575,7 @@ def homepage():
     utxo_info = 'All UTXOs: ' + json.dumps(utxos)
     blockchain_info = 'Blockchain Explorer: ' + json.dumps(session['blocks'])
     view_source_code_link = "<a href='source_code'>View source code</a>"
-    return announcement+('<br /><br />\r\n\r\n'.join([view_source_code_link, genesis_block_info, addr_info, balance_info, utxo_info, blockchain_info]))
+    return announcement+('<br /><br />\r\n\r\n'.join([view_source_code_link, weight_info, genesis_block_info, addr_info, balance_info, utxo_info, blockchain_info]))
 	
 @app.route(url_prefix+'/flag')
 def getFlag():
@@ -519,7 +586,7 @@ def getFlag():
     if balance[attacker_address] >= 1000000:  # If attacker has the treasure
         return FLAG()
     
-    return f'To get the flag, you need to control the treasure (1,000,000 coins). Attacker currently has {balance[attacker_address]} coins. Hint: Try a long-range attack to rewrite history!'
+    return f'To get the flag, you need to control the treasure (1,000,000 coins). Attacker currently has {balance[attacker_address]} coins. Current chain weight: {getattr(tail, "chain_weight", "unknown")}. Hint: Try a long-range attack to create a heavier chain!'
 
 def find_enough_utxos(utxos, addr_from, amount):
     collected = []
@@ -550,9 +617,12 @@ def submit_block():
         append_block(block)
         msg = 'Block submitted successfully.'
         
-        # Check if this creates a longer chain
-        balance, utxos, tail = get_balance_of_all()
-        return msg + f' Current chain height: {tail["height"]}'
+        # Show current chain status
+        tail = find_blockchain_tail()
+        if tail:
+            return msg + f' Current heaviest chain height: {tail["height"]}, weight: {getattr(tail, "chain_weight", "calculating...")}'
+        else:
+            return msg + ' No chain found.'
         
     except Exception as e:
         return str(e)
@@ -588,15 +658,17 @@ def show_source_code():
 
 @app.route(url_prefix+'/validator_info')
 def validator_info():
-    """Show information about validator selection"""
+    """Show information about validator selection and chain weights"""
     init()
     balance, utxos, tail = get_balance_of_all()
     
-    info = "=== Validator Information ===<br/>"
-    info += f"Current block height: {tail['height']}<br/>"
-    info += f"Current chain head: {tail['hash']}<br/><br/>"
+    info = "=== PoS Heaviest Chain Information ===<br/>"
+    if tail:
+        info += f"Current heaviest chain height: {tail['height']}<br/>"
+        info += f"Current chain weight: {getattr(tail, 'chain_weight', 'calculating...')}<br/>"
+        info += f"Current chain head: {tail['hash']}<br/><br/>"
     
-    info += "Validator Stakes:<br/>"
+    info += "Validator Stakes (used for block weight calculation):<br/>"
     for addr in [validator1_address, validator2_address, validator3_address, attacker_address]:
         stake = get_validator_stake(addr, utxos)
         name = "Validator1" if addr == validator1_address else \
@@ -604,12 +676,55 @@ def validator_info():
                "Validator3" if addr == validator3_address else "Attacker"
         info += f"{name}: {stake} coins<br/>"
     
-    info += "<br/>Next validator selection depends on:<br/>"
-    info += "- Previous block hash<br/>"
-    info += "- Timestamp (THIS IS THE VULNERABILITY!)<br/>"
-    info += "- Current stakes<br/><br/>"
+    info += "<br/>Block Weight Calculation:<br/>"
+    info += "- Block Weight = Validator Stake × 100<br/>"
+    info += "- Chain Weight = Sum of all block weights in chain<br/>"
+    info += "- Heaviest chain becomes the canonical chain<br/><br/>"
     
-    info += "Hint: What if you could go back in time and create an alternative history where you had more stake?<br/>"
+    info += "Long-Range Attack Strategy:<br/>"
+    info += "1. Build alternative chain from genesis<br/>"
+    info += "2. Give yourself more stake in early blocks<br/>"
+    info += "3. Create blocks with higher validator stakes<br/>"
+    info += "4. Make your chain heavier than the current chain<br/>"
+    info += "5. Transfer treasure to yourself<br/><br/>"
+    
+    info += "Hint: Create a genesis-fork where you control more initial stake!<br/>"
+    
+    return info
+
+@app.route(url_prefix+'/chain_analysis')
+def chain_analysis():
+    """Analyze all chains and their weights"""
+    init()
+    
+    # Find all chain tips
+    all_hashes = set(session['blocks'].keys())
+    child_hashes = set()
+    
+    for block in session['blocks'].values():
+        if block['prev'] in all_hashes:
+            child_hashes.add(block['prev'])
+    
+    tip_hashes = all_hashes - child_hashes
+    
+    info = "=== Chain Analysis ===<br/>"
+    info += f"Total blocks: {len(session['blocks'])}<br/>"
+    info += f"Chain tips: {len(tip_hashes)}<br/><br/>"
+    
+    heaviest_weight = 0
+    for tip_hash in tip_hashes:
+        chain = get_chain_from_block(tip_hash)
+        weight = calculate_chain_weight(chain)
+        
+        info += f"Chain ending at {tip_hash[:16]}...<br/>"
+        info += f"  Length: {len(chain)} blocks<br/>"
+        info += f"  Weight: {weight}<br/>"
+        info += f"  Validator sequence: {' -> '.join([b['validator'][:8] + '...' for b in chain[-5:]])}<br/><br/>"
+        
+        if weight > heaviest_weight:
+            heaviest_weight = weight
+    
+    info += f"Heaviest chain weight: {heaviest_weight}<br/>"
     
     return info
 	
